@@ -24,11 +24,13 @@ Name: "{app}"
 Name: "{userdocs}\FPI"
 
 [Files]
-; The application is embedded into the installer by GitHub Actions.
 Source: "..\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
+[Tasks]
+Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительные значки:"; Flags: unchecked
+
 [Icons]
-Name: "{autodesktop}\PRomda FileShare"; Filename: "{app}\{#AppExe}"
+Name: "{autodesktop}\PRomda FileShare"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 Name: "{group}\PRomda FileShare"; Filename: "{app}\{#AppExe}"
 
 [Run]
