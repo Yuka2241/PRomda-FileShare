@@ -43,7 +43,7 @@ public sealed class ClientSession : IDisposable, IAsyncDisposable
     }
 
     public async Task<bool> DownloadAsync(
-        string file, string destination, IProgress<long>? progress = null, CancellationToken ct = default)
+        string file, string destination, IProgress<(long completed, long total)>? progress = null, CancellationToken ct = default)
     {
         if (disposed) throw new ObjectDisposedException(nameof(ClientSession));
 
@@ -58,7 +58,7 @@ public sealed class ClientSession : IDisposable, IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
 
         await using var fs = new FileStream(destination, FileMode.Create, FileAccess.Write, System.IO.FileShare.None);
-        var buf = new byte[64 * 1024];
+        var buf = new byte[64 * 64 * 16];
         long total = 0;
 
         while (total < p.Size)
@@ -68,7 +68,7 @@ public sealed class ClientSession : IDisposable, IAsyncDisposable
             if (n <= 0) break;
             await fs.WriteAsync(buf.AsMemory(0, n), ct);
             total += n;
-            progress?.Report(total);
+            progress?.Report((total, p.Size));
         }
 
         return total == p.Size;
