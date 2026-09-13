@@ -10,5 +10,6 @@
     <AssemblyName>PRomda.FileShare</AssemblyName>
     <RootNamespace>PRomda.FileShare</RootNamespace>
     <Platforms>AnyCPU</Platforms>
+    <ApplicationIcon>Assets\PRomda-FileShare-Icon.ico</ApplicationIcon>
   </PropertyGroup>
 </Project>
