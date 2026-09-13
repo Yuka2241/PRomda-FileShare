@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -8,6 +9,7 @@ public sealed class Server
 {
     private readonly Func<AccessRequest, Task<bool>> accessApproval;
     private readonly Dictionary<string, string> libraries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> sessions = new(StringComparer.Ordinal);
     private TcpListener? listener;
     private CancellationTokenSource? cts;
 
@@ -34,6 +36,7 @@ public sealed class Server
     {
         try { cts?.Cancel(); listener?.Stop(); } catch { }
         listener = null;
+        sessions.Clear();
     }
 
     private async Task AcceptLoop(CancellationToken ct)
@@ -58,7 +61,15 @@ public sealed class Server
             try
             {
                 var hello = await Protocol.ReceiveAsync(s, ct);
-                if (hello?.Type != "ACCESS_REQUEST" || string.IsNullOrWhiteSpace(hello.Code)) return;
+                if (hello == null) return;
+
+                if (hello.Type == "WATCH_REQUEST")
+                {
+                    await HandleWatcher(s, hello, ct);
+                    return;
+                }
+
+                if (hello.Type != "ACCESS_REQUEST" || string.IsNullOrWhiteSpace(hello.Code)) return;
 
                 if (!libraries.TryGetValue(hello.Code, out var folder))
                 {
@@ -71,7 +82,6 @@ public sealed class Server
                     hello.Code,
                     hello.Message ?? "Unknown user");
 
-                // One permission request per connection, at connection time only.
                 var ok = await accessApproval(req);
                 if (!ok)
                 {
@@ -79,18 +89,12 @@ public sealed class Server
                     return;
                 }
 
-                var list = Directory.Exists(folder)
-                    ? Directory.EnumerateFiles(folder)
-                        .Select(Path.GetFileName)
-                        .Where(x => x != null)
-                        .Cast<string>()
-                        .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                        .ToArray()
-                    : Array.Empty<string>();
+                var sessionToken = CodeGenerator.RandomToken(24);
+                sessions[sessionToken] = folder;
 
-                await Protocol.SendAsync(s, new("ACCESS_GRANTED", Files: list), ct);
+                var list = GetFiles(folder);
+                await Protocol.SendAsync(s, new("ACCESS_GRANTED", Message: sessionToken, Files: list), ct);
 
-                // Keep the approved TCP session alive. Downloads require no extra approval.
                 while (!ct.IsCancellationRequested)
                 {
                     var p = await Protocol.ReceiveAsync(s, ct);
@@ -121,5 +125,94 @@ public sealed class Server
             catch (OperationCanceledException) { }
             catch { }
         }
+    }
+
+    private async Task HandleWatcher(NetworkStream stream, Packet request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.Message) || !sessions.TryGetValue(request.Message, out var folder))
+        {
+            await Protocol.SendAsync(stream, new("WATCH_DENIED", Message: "Session expired"), ct);
+            return;
+        }
+
+        await Protocol.SendAsync(stream, new("FILE_LIST_UPDATE", Files: GetFiles(folder)), ct);
+
+        using var watcher = new FileSystemWatcher(folder)
+        {
+            IncludeSubdirectories = false,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+            EnableRaisingEvents = true
+        };
+
+        var sendGate = new SemaphoreSlim(1, 1);
+        var debounceGate = new object();
+        CancellationTokenSource? pending = null;
+
+        async Task PushListAsync()
+        {
+            try
+            {
+                await sendGate.WaitAsync(ct);
+                try
+                {
+                    await Protocol.SendAsync(stream, new("FILE_LIST_UPDATE", Files: GetFiles(folder)), ct);
+                }
+                finally { sendGate.Release(); }
+            }
+            catch { }
+        }
+
+        void Changed(object? _, FileSystemEventArgs __)
+        {
+            lock (debounceGate)
+            {
+                pending?.Cancel();
+                pending?.Dispose();
+                pending = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var token = pending.Token;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(450, token);
+                        await PushListAsync();
+                    }
+                    catch { }
+                }, token);
+            }
+        }
+
+        void Renamed(object? _, RenamedEventArgs __) => Changed(_, __);
+        watcher.Created += Changed;
+        watcher.Deleted += Changed;
+        watcher.Changed += Changed;
+        watcher.Renamed += Renamed;
+
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            watcher.EnableRaisingEvents = false;
+            lock (debounceGate) pending?.Cancel();
+            sendGate.Dispose();
+        }
+    }
+
+    private static string[] GetFiles(string folder)
+    {
+        if (!Directory.Exists(folder)) return Array.Empty<string>();
+        try
+        {
+            return Directory.EnumerateFiles(folder)
+                .Select(Path.GetFileName)
+                .Where(x => x != null)
+                .Cast<string>()
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch { return Array.Empty<string>(); }
     }
 }
