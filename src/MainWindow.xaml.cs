@@ -5,6 +5,7 @@ using System.Net.NetworkInformation;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using Forms = System.Windows.Forms;
 using WpfMessageBox = System.Windows.MessageBox;
 using WpfMessageBoxButton = System.Windows.MessageBoxButton;
@@ -31,6 +32,7 @@ public partial class MainWindow : Window
     private string? currentCode;
     private readonly Forms.NotifyIcon trayIcon;
     private readonly Forms.ContextMenuStrip trayMenu;
+    private DownloadProgressWindow? downloadProgressWindow;
     private bool allowRealClose;
 
     public MainWindow()
@@ -327,34 +329,51 @@ public partial class MainWindow : Window
         var completed = 0;
         var failed = 0;
 
-        foreach (var file in remoteFiles.ToArray())
+        downloadProgressWindow = new DownloadProgressWindow();
+        downloadProgressWindow.Show();
+        downloadProgressWindow.SetProgress("Подготовка...", 0, total, 0, 0);
+
+        try
         {
-            var cleanFileName = Path.GetFileName(file);
-            if (string.IsNullOrWhiteSpace(cleanFileName))
+            foreach (var file in remoteFiles.ToArray())
             {
-                failed++;
-                continue;
-            }
-
-            var destination = GetUniqueTargetPath(dlg.SelectedPath, cleanFileName);
-            try
-            {
-                var progress = new Progress<long>(bytes =>
+                var cleanFileName = Path.GetFileName(file);
+                if (string.IsNullOrWhiteSpace(cleanFileName))
                 {
-                    RemoteStatus.Text = $"Скачивание {completed + 1}/{total}: {cleanFileName} · {FormatSize(bytes)}";
-                });
-                var ok = await clientSession.DownloadAsync(cleanFileName, destination, progress);
-                if (ok) completed++; else failed++;
-            }
-            catch
-            {
-                failed++;
-            }
-        }
+                    failed++;
+                    continue;
+                }
 
-        RemoteStatus.Text = failed == 0
-            ? $"Готово. Скачано файлов: {completed}."
-            : $"Скачивание завершено. Успешно: {completed}, ошибок: {failed}.";
+                var destination = GetUniqueTargetPath(dlg.SelectedPath, cleanFileName);
+                try
+                {
+                    var fileIndex = completed + failed + 1;
+                    downloadProgressWindow.SetProgress(cleanFileName, fileIndex, total, 0, 0);
+                    var progress = new Progress<(long completed, long total)>(p =>
+                    {
+                        downloadProgressWindow?.SetProgress(cleanFileName, fileIndex, total, p.completed, p.total);
+                        RemoteStatus.Text = $"Скачивание {fileIndex}/{total}: {cleanFileName} · {FormatSize(p.completed)} / {FormatSize(p.total)}";
+                    });
+                    var ok = await clientSession.DownloadAsync(cleanFileName, destination, progress);
+                    if (ok) completed++; else failed++;
+                }
+                catch
+                {
+                    failed++;
+                }
+            }
+
+            downloadProgressWindow.SetCompleted(completed, total, failed);
+            RemoteStatus.Text = failed == 0
+                ? $"Готово. Скачано файлов: {completed}."
+                : $"Скачивание завершено. Успешно: {completed}, ошибок: {failed}.";
+            await Task.Delay(1100);
+        }
+        finally
+        {
+            downloadProgressWindow?.Close();
+            downloadProgressWindow = null;
+        }
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -432,5 +451,133 @@ public partial class MainWindow : Window
         trayMenu.Dispose();
         accessApprovalGate.Dispose();
         base.OnClosed(e);
+    }
+}
+
+internal sealed class DownloadProgressWindow : Window
+{
+    private readonly TextBlock titleText;
+    private readonly TextBlock percentText;
+    private readonly TextBlock detailText;
+    private readonly ProgressBar progressBar;
+
+    public DownloadProgressWindow()
+    {
+        Title = "PRomda FileShare";
+        Width = 350;
+        Height = 112;
+        WindowStyle = WindowStyle.None;
+        ResizeMode = ResizeMode.NoResize;
+        ShowInTaskbar = false;
+        ShowActivated = false;
+        Topmost = true;
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Background = Brushes.Transparent;
+
+        var border = new Border
+        {
+            Background = new SolidColorBrush(Color.FromRgb(9, 9, 9)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(42, 42, 42)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(14)
+        };
+
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        titleText = new TextBlock
+        {
+            Foreground = Brushes.White,
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        Grid.SetRow(titleText, 0);
+
+        percentText = new TextBlock
+        {
+            Foreground = Brushes.White,
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        Grid.SetRow(percentText, 0);
+
+        var header = new Grid();
+        header.Children.Add(titleText);
+        header.Children.Add(percentText);
+        grid.Children.Add(header);
+
+        progressBar = new ProgressBar
+        {
+            Minimum = 0,
+            Maximum = 100,
+            Height = 7,
+            Margin = new Thickness(0, 10, 0, 7),
+            IsIndeterminate = false
+        };
+        Grid.SetRow(progressBar, 1);
+        grid.Children.Add(progressBar);
+
+        detailText = new TextBlock
+        {
+            Foreground = new SolidColorBrush(Color.FromRgb(120, 120, 120)),
+            FontSize = 10,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        Grid.SetRow(detailText, 2);
+        grid.Children.Add(detailText);
+
+        border.Child = grid;
+        Content = border;
+
+        Loaded += (_, _) => PositionWindow();
+    }
+
+    private void PositionWindow()
+    {
+        var area = SystemParameters.WorkArea;
+        Left = area.Right - Width - 18;
+        Top = area.Bottom - Height - 18;
+    }
+
+    public void SetProgress(string fileName, int fileIndex, int totalFiles, long completed, long total)
+    {
+        titleText.Text = $"Скачивание: {fileName}";
+        if (total > 0)
+        {
+            var percent = Math.Clamp((double)completed / total * 100.0, 0, 100);
+            progressBar.Value = percent;
+            percentText.Text = $"{percent:0}%";
+            detailText.Text = $"Файл {fileIndex} из {totalFiles} · {FormatSize(completed)} / {FormatSize(total)}";
+        }
+        else
+        {
+            progressBar.Value = 0;
+            percentText.Text = "0%";
+            detailText.Text = $"Файл {fileIndex} из {totalFiles} · подготовка";
+        }
+    }
+
+    public void SetCompleted(int completedFiles, int totalFiles, int failedFiles)
+    {
+        titleText.Text = "Скачивание завершено";
+        progressBar.Value = 100;
+        percentText.Text = "100%";
+        detailText.Text = failedFiles == 0
+            ? $"Готово · файлов: {completedFiles}/{totalFiles}"
+            : $"Готово · успешно: {completedFiles}, ошибок: {failedFiles}";
+    }
+
+    private static string FormatSize(long n)
+    {
+        string[] u = { "Б", "КБ", "МБ", "ГБ" };
+        double d = n;
+        int i = 0;
+        while (d >= 1024 && i < u.Length - 1) { d /= 1024; i++; }
+        return $"{d:0.##} {u[i]}";
     }
 }
